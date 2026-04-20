@@ -18,7 +18,42 @@
 #include <linux/major.h>
 #include <linux/atomic.h>
 #include <asm/barrier.h>
+#include <linux/of.h>
+#include <linux/of_reserved_mem.h>
+#include <linux/io.h>
 #include "debug_uio.h"
+
+/* -----------------------------------------------------------------------
+ * Device Tree compatible strings
+ * ----------------------------------------------------------------------- */
+
+#define DEBUG_UIO_DT_COMPAT_FIRMWARE "qcom,debug-uio-firmware"
+#define DEBUG_UIO_DT_COMPAT_HOST     "qcom,debug-uio-host"
+#define DEBUG_UIO_DT_COMPAT_NSS      "qcom,debug-uio-nss"
+
+static const char *debug_uio_dt_compat[DEBUG_UIO_DEV_MAX] = {
+	DEBUG_UIO_DT_COMPAT_FIRMWARE,
+	DEBUG_UIO_DT_COMPAT_HOST,
+	DEBUG_UIO_DT_COMPAT_NSS,
+};
+
+/* -----------------------------------------------------------------------
+ * Device Tree memory tracking structure
+ * ----------------------------------------------------------------------- */
+
+/**
+ * struct debug_uio_dt_mem - Per-device device tree memory information
+ * @np:            Device tree node pointer
+ * @rmem:          Reserved memory region information
+ * @base_addr:     Virtual base address (from ioremap)
+ * @is_dt_memory:  true if memory is from device tree, false if kzalloc'd
+ */
+struct debug_uio_dt_mem {
+	struct device_node *np;
+	struct reserved_mem *rmem;
+	void __iomem *base_addr;
+	bool is_dt_memory;
+};
 
 /* -----------------------------------------------------------------------
  * Module-level state
@@ -57,6 +92,13 @@ static void *mem[DEBUG_UIO_DEV_MAX][DEBUG_UIO_MAPS_PER_DEV_MAX];
  */
 static struct blocking_notifier_head
 	notifier_chains[DEBUG_UIO_DEV_MAX][DEBUG_UIO_MAPS_PER_DEV_MAX];
+
+/*
+ * dt_mem[] – device tree memory tracking for each UIO device.
+ * Stores device tree node, reserved memory info, and virtual base address
+ * for devices that use device tree memory allocation.
+ */
+static struct debug_uio_dt_mem dt_mem[DEBUG_UIO_DEV_MAX];
 
 /* -----------------------------------------------------------------------
  * UIO framework callbacks
@@ -156,7 +198,7 @@ static int debug_uio_release(struct uio_info *info, struct inode *inode)
  */
 static irqreturn_t debug_uio_irq_handler(int irq, struct uio_info *info)
 {
-	DEBUG_INFO("irq: %d.", irq);
+	pr_info("irq: %d.", irq);
 	return IRQ_HANDLED;
 }
 
@@ -219,7 +261,7 @@ static int debug_uio_mmap(struct uio_info *info, struct vm_area_struct *vma)
 	ret = remap_pfn_range(vma, vma->vm_start, pfn,
 			vma->vm_end - vma->vm_start, vma->vm_page_prot);
 	if (ret)
-		DEBUG_WARN("remap_pfn_range failed for map %lu\n", vma->vm_pgoff);
+		pr_info("remap_pfn_range failed for map %lu\n", vma->vm_pgoff);
 
 	return ret;
 }
@@ -290,14 +332,14 @@ void *debug_uio_alloc_mem(enum debug_uio_dev dev_type,
 	unsigned long flags;
 
 	if (is_coherent) {
-		DEBUG_WARN("Coherent allocation not supported.\n");
+		pr_info("Coherent allocation not supported.\n");
 		return NULL;
 	}
 
 	map_size = debug_uio_round_up_to_page_size(map_size);
 	memory = kzalloc(map_size, GFP_KERNEL);
 	if (!memory) {
-		DEBUG_WARN("Memory allocation failed for %s.\n",
+		pr_info("Memory allocation failed for %s.\n",
 			debug_uio_map_type_str[dev_type][map_type]);
 		return NULL;
 	}
@@ -363,7 +405,7 @@ void *debug_uio_get_mem(enum debug_uio_dev dev_type, int map_type)
 	spin_lock_irqsave(&info_global[dev_type].uio_lock, flags);
 
 	if (info->mem[map_type].name)
-		addr = phys_to_virt(info->mem[map_type].addr);
+		addr = mem[dev_type][map_type];
 
 	spin_unlock_irqrestore(&info_global[dev_type].uio_lock, flags);
 	return addr;
@@ -534,7 +576,7 @@ static bool debug_uio_interrupt_ring_enqueue(
 	struct debug_uio_intr_data entry;
 
 	if (!rb) {
-		DEBUG_WARN("interrupt ring buffer pointer is NULL\n");
+		pr_info("interrupt ring buffer pointer is NULL\n");
 		return false;
 	}
 
@@ -548,7 +590,7 @@ static bool debug_uio_interrupt_ring_enqueue(
 	next_rear = (rear + 1) % RING_SIZE;
 
 	if (next_rear == front) {
-		DEBUG_WARN("interrupt ring buffer is full (dev=%d)\n", dev_type);
+		pr_info("interrupt ring buffer is full (dev=%d)\n", dev_type);
 		return false;
 	}
 
@@ -611,7 +653,7 @@ static bool debug_uio_data_ring_enqueue(
 	struct debug_uio_data entry;
 
 	if (!rb) {
-		DEBUG_WARN("data ring buffer pointer is NULL\n");
+		pr_info("data ring buffer pointer is NULL\n");
 		return false;
 	}
 
@@ -621,7 +663,7 @@ static bool debug_uio_data_ring_enqueue(
 	next_rear = (rear + 1) % MAX_NUM_DATA_BUFFERS;
 
 	if (next_rear == front) {
-		DEBUG_WARN("data ring buffer is full\n");
+		pr_info("data ring buffer is full\n");
 		return false;
 	}
 
@@ -680,7 +722,7 @@ static int debug_uio_find_dev_by_name(const char *dev_name)
 			return i;
 	}
 
-	DEBUG_WARN("Unknown UIO device name \"%s\"\n", dev_name);
+	pr_info("Unknown UIO device name \"%s\"\n", dev_name);
 	return -ENODEV;
 }
 
@@ -732,17 +774,18 @@ int debug_uio_notify(const char *dev_name, uint32_t offset, uint32_t size)
 
 	info = info_global[dev_type].info;
 	if (!info) {
-		DEBUG_WARN("UIO info not initialised for \"%s\"\n", dev_name);
+		pr_info("UIO info not initialised for \"%s\"\n", dev_name);
 		return -EINVAL;
 	}
 
 	if (!info->mem[DEBUG_UIO_MAP_TYPE_INTERRUPT].addr) {
-		DEBUG_WARN("Interrupt map not allocated for \"%s\"\n", dev_name);
+		pr_info("Interrupt map not allocated for \"%s\"\n", dev_name);
 		return -EINVAL;
 	}
 
+	/* Use stored virtual address directly instead of phys_to_virt() */
 	intr_rb = (struct debug_uio_interrupt_ring_buffer *)
-		phys_to_virt(info->mem[DEBUG_UIO_MAP_TYPE_INTERRUPT].addr);
+		mem[dev_type][DEBUG_UIO_MAP_TYPE_INTERRUPT];
 
 	/*
 	 * map_type in the ring entry is always INTERRUPT because this
@@ -751,7 +794,7 @@ int debug_uio_notify(const char *dev_name, uint32_t offset, uint32_t size)
 	if (!debug_uio_interrupt_ring_enqueue(intr_rb, dev_type,
 					      DEBUG_UIO_MAP_TYPE_INTERRUPT,
 					      offset, size)) {
-		DEBUG_WARN("Interrupt ring enqueue failed for \"%s\"\n", dev_name);
+		pr_info("Interrupt ring enqueue failed for \"%s\"\n", dev_name);
 		return -ENOSPC;
 	}
 
@@ -812,20 +855,21 @@ int debug_uio_write_data(const char *dev_name,
 
 	info = info_global[dev_type].info;
 	if (!info) {
-		DEBUG_WARN("UIO info not initialised for \"%s\"\n", dev_name);
+		pr_info("UIO info not initialised for \"%s\"\n", dev_name);
 		return -EINVAL;
 	}
 
 	if (!info->mem[DEBUG_UIO_MAP_TYPE_DATA].addr) {
-		DEBUG_WARN("Data map not allocated for \"%s\"\n", dev_name);
+		pr_info("Data map not allocated for \"%s\"\n", dev_name);
 		return -EINVAL;
 	}
 
+	/* Use stored virtual address directly instead of phys_to_virt() */
 	data_rb = (struct debug_uio_data_ring_buffer *)
-		phys_to_virt(info->mem[DEBUG_UIO_MAP_TYPE_DATA].addr);
+		mem[dev_type][DEBUG_UIO_MAP_TYPE_DATA];
 
 	if (!debug_uio_data_ring_enqueue(data_rb, data, data_size)) {
-		DEBUG_WARN("Data ring enqueue failed for \"%s\"\n", dev_name);
+		pr_info("Data ring enqueue failed for \"%s\"\n", dev_name);
 		return -ENOSPC;
 	}
 
@@ -964,22 +1008,22 @@ static long debug_uio_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case IOCTL_SEND_INTERRUPT:
 		if (copy_from_user(&data, (void __user *)arg, sizeof(data))) {
-			DEBUG_WARN("copy_from_user failed.\n");
+			pr_info("copy_from_user failed.\n");
 			return -EFAULT;
 		}
 
-		DEBUG_INFO("IOCTL_SEND_INTERRUPT: uioId=%d mapId=%d\n",
+		pr_info("IOCTL_SEND_INTERRUPT: uioId=%d mapId=%d\n",
 			data.uioId, data.mapId);
 
 		if (data.uioId >= DEBUG_UIO_DEV_MAX) {
-			DEBUG_WARN("Invalid uioId %d\n", data.uioId);
+			pr_info("Invalid uioId %d\n", data.uioId);
 			return -EINVAL;
 		}
 
 		info = info_global[data.uioId].info;
 
 		if (!info->mem[data.mapId].name) {
-			DEBUG_WARN("Map %d not allocated for device %d\n",
+			pr_info("Map %d not allocated for device %d\n",
 				data.mapId, data.uioId);
 			return -ENOTTY;
 		}
@@ -990,7 +1034,7 @@ static long debug_uio_ioctl(struct file *file, unsigned int cmd,
 		break;
 
 	default:
-		DEBUG_WARN("Unknown ioctl command 0x%x\n", cmd);
+		pr_info("Unknown ioctl command 0x%x\n", cmd);
 		return -ENOTTY;
 	}
 
@@ -1003,6 +1047,106 @@ static const struct file_operations fops = {
 };
 
 /* -----------------------------------------------------------------------
+ * Device Tree parsing
+ * ----------------------------------------------------------------------- */
+
+/**
+ * debug_uio_parse_dt_memory() - Parse device tree to get reserved memory
+ *                                for a specific UIO device.
+ *
+ * Description:
+ *   Attempts to locate and map a device tree reserved memory region for
+ *   the specified device.  The function performs the following steps:
+ *     1. Searches for a device tree node matching the device-specific
+ *        compatible string (e.g., "qcom,debug-uio-firmware").
+ *     2. Looks up the associated reserved memory region.
+ *     3. Validates that the region is large enough (>= 2 * PAGE_SIZE).
+ *     4. Maps the physical memory to a kernel virtual address via ioremap.
+ *     5. Stores the node pointer, reserved memory info, and virtual address
+ *        in dt_mem[dev_type] for later use.
+ *
+ *   If any step fails, the function logs an informational message and
+ *   returns an error code, allowing the caller to fall back to kzalloc.
+ *
+ * Input:
+ *   @dev_type – Target UIO device (DEBUG_UIO_DEV_FIRMWARE /
+ *               DEBUG_UIO_DEV_HOST / DEBUG_UIO_DEV_NSS).
+ *
+ * Output:
+ *   On success: dt_mem[dev_type] is populated with device tree node,
+ *   reserved memory info, virtual base address, and is_dt_memory flag
+ *   is set to true.
+ *
+ * Return:
+ *    0       – Success; device tree memory found and mapped.
+ *   -ENODEV  – No device tree node found for this device.
+ *   -EINVAL  – Reserved memory not found or size too small.
+ *   -ENOMEM  – ioremap failed.
+ */
+static int debug_uio_parse_dt_memory(enum debug_uio_dev dev_type)
+{
+	struct device_node *np;
+	struct reserved_mem *rmem;
+	void __iomem *base_addr;
+
+	/* Step 1: Find device tree node by compatible string */
+	np = of_find_compatible_node(NULL, NULL, debug_uio_dt_compat[dev_type]);
+	if (!np) {
+		pr_info("No DT node for %s, using kzalloc fallback\n",
+			   debug_uio_dev_str[dev_type]);
+		return -ENODEV;
+	}
+
+	/* Step 2: Get reserved memory region */
+	rmem = of_reserved_mem_lookup(np);
+	if (!rmem) {
+		pr_info("No reserved memory for %s\n",
+			   debug_uio_dev_str[dev_type]);
+		of_node_put(np);
+		return -EINVAL;
+	}
+
+	/* Validate size: must be at least 2 * PAGE_SIZE for 2 maps */
+	if (rmem->size < 2 * PAGE_SIZE) {
+		pr_info("Reserved memory too small for %s: %llu bytes (min %lu)\n",
+			   debug_uio_dev_str[dev_type],
+			   (unsigned long long)rmem->size,
+			   2 * PAGE_SIZE);
+		of_node_put(np);
+		return -EINVAL;
+	}
+
+	/* Step 3: Map physical memory to virtual address using memremap
+	 * instead of ioremap because we need normal memory semantics for
+	 * atomic operations and memset in ring buffer initialization.
+	 * MEMREMAP_WB provides write-back cacheable memory mapping.
+	 */
+	base_addr = memremap(rmem->base, rmem->size, MEMREMAP_WB);
+	if (!base_addr) {
+		pr_info("memremap failed for %s (base=0x%llx size=0x%llx)\n",
+			   debug_uio_dev_str[dev_type],
+			   (unsigned long long)rmem->base,
+			   (unsigned long long)rmem->size);
+		of_node_put(np);
+		return -ENOMEM;
+	}
+
+	/* Store device tree memory information */
+	dt_mem[dev_type].np = np;
+	dt_mem[dev_type].rmem = rmem;
+	dt_mem[dev_type].base_addr = base_addr;
+	dt_mem[dev_type].is_dt_memory = true;
+
+	pr_info("DT memory for %s: phys=0x%llx virt=%px size=0x%llx\n",
+		   debug_uio_dev_str[dev_type],
+		   (unsigned long long)rmem->base,
+		   base_addr,
+		   (unsigned long long)rmem->size);
+
+	return 0;
+}
+
+/* -----------------------------------------------------------------------
  * Module init / exit helpers
  * ----------------------------------------------------------------------- */
 
@@ -1011,9 +1155,11 @@ static const struct file_operations fops = {
  *
  * Description:
  *   Iterates over every (device, map) slot and frees the kzalloc'd page
- *   stored in mem[][].  Called both on error unwind during init and during
- *   module exit.  The device spinlock is held per device while freeing its
- *   maps to prevent races with any concurrent alloc/get calls.
+ *   stored in mem[][].  Device tree memory is NOT freed here (it's
+ *   unmapped separately in debug_uio_cleanup_dt()).  Called both on error
+ *   unwind during init and during module exit.  The device spinlock is
+ *   held per device while freeing its maps to prevent races with any
+ *   concurrent alloc/get calls.
  *
  * Input:
  *   None.
@@ -1033,14 +1179,66 @@ static void debug_uio_cleanup_mem(void)
 		num_maps = debug_uio_num_maps_per_device[dev_type];
 		spin_lock_irqsave(&info_global[dev_type].uio_lock, flags);
 
-		for (map_type = 0; map_type < num_maps; map_type++) {
-			if (mem[dev_type][map_type]) {
-				kfree(mem[dev_type][map_type]);
+		/* Only free kzalloc'd memory, not device tree memory */
+		if (!dt_mem[dev_type].is_dt_memory) {
+			for (map_type = 0; map_type < num_maps; map_type++) {
+				if (mem[dev_type][map_type]) {
+					kfree(mem[dev_type][map_type]);
+					mem[dev_type][map_type] = NULL;
+				}
+			}
+		} else {
+			/* Just clear pointers for DT memory */
+			for (map_type = 0; map_type < num_maps; map_type++) {
 				mem[dev_type][map_type] = NULL;
 			}
 		}
 
 		spin_unlock_irqrestore(&info_global[dev_type].uio_lock, flags);
+	}
+}
+
+/**
+ * debug_uio_cleanup_dt() - Clean up device tree resources.
+ *
+ * Description:
+ *   Iterates over all devices and releases device tree resources:
+ *   unmaps ioremap'd memory and releases device tree node references.
+ *   Called during module exit after all other cleanup is complete.
+ *
+ * Input:
+ *   None.
+ *
+ * Output:
+ *   All dt_mem[] entries are cleared and resources released.
+ *
+ * Return:
+ *   void.
+ */
+static void debug_uio_cleanup_dt(void)
+{
+	int dev_type;
+
+	for (dev_type = 0; dev_type < DEBUG_UIO_DEV_MAX; dev_type++) {
+		if (dt_mem[dev_type].is_dt_memory) {
+			/* Unmap memremap'd memory */
+			if (dt_mem[dev_type].base_addr) {
+				memunmap(dt_mem[dev_type].base_addr);
+				dt_mem[dev_type].base_addr = NULL;
+			}
+
+			/* Release device tree node reference */
+			if (dt_mem[dev_type].np) {
+				of_node_put(dt_mem[dev_type].np);
+				dt_mem[dev_type].np = NULL;
+			}
+
+			dt_mem[dev_type].rmem = NULL;
+			dt_mem[dev_type].is_dt_memory = false;
+
+			pr_info("Cleaned up DT resources for %s\n",
+				   debug_uio_dev_str[dev_type]);
+		}
 	}
 }
 
@@ -1108,10 +1306,10 @@ static void debug_uio_cleanup_dev(void)
  *                              from the driver core.
  *
  * Description:
- *   Calls device_unregister() for dev_global[0] through dev_global[count-1].
- *   Used both in the error unwind path (where only a subset of devices may
- *   have been registered) and in debug_uio_exit() (where all devices are
- *   unregistered by passing DEBUG_UIO_DEV_MAX).
+ *   Calls device_del() and put_device() for dev_global[0] through
+ *   dev_global[count-1]. Used both in the error unwind path (where only
+ *   a subset of devices may have been registered) and in debug_uio_exit()
+ *   (where all devices are unregistered by passing DEBUG_UIO_DEV_MAX).
  *
  * Input:
  *   @count – Number of devices to unregister, starting from index 0.
@@ -1130,8 +1328,10 @@ static void debug_uio_dev_unregister(int count)
 	int i;
 
 	for (i = 0; i < count; i++) {
-		if (dev_global[i])
-			device_unregister(dev_global[i]);
+		if (dev_global[i]) {
+			device_del(dev_global[i]);
+			put_device(dev_global[i]);
+		}
 	}
 }
 
@@ -1183,7 +1383,8 @@ static void debug_uio_unregister(int count)
  *     4. Unregister all struct devices from the driver core.
  *     5. Free the struct device objects.
  *     6. Free the uio_info structs.
- *     7. Free the map memory pages.
+ *     7. Free the kzalloc'd map memory pages.
+ *     8. Clean up device tree resources (iounmap and of_node_put).
  *
  * Input:
  *   None.
@@ -1205,6 +1406,7 @@ static void __exit debug_uio_exit(void)
 	debug_uio_cleanup_dev();
 	debug_uio_cleanup_uio();
 	debug_uio_cleanup_mem();
+	debug_uio_cleanup_dt();
 }
 
 /* -----------------------------------------------------------------------
@@ -1263,20 +1465,43 @@ static int __init debug_uio_init(void)
 
 	/* ------------------------------------------------------------------
 	 * Step 1: Allocate map memory and initialise ring buffers.
+	 *         Try device tree first, fall back to kzalloc if unavailable.
 	 * ------------------------------------------------------------------ */
 	for (dev_type = 0; dev_type < DEBUG_UIO_DEV_MAX; dev_type++) {
 		num_maps = debug_uio_num_maps_per_device[dev_type];
 
-		for (map_type = 0; map_type < num_maps; map_type++) {
-			memory = kzalloc(PAGE_SIZE, GFP_KERNEL);
-			if (!memory) {
-				DEBUG_WARN("Memory allocation failed for dev=%d map=%d\n",
-					dev_type, map_type);
-				ret = -ENOMEM;
-				goto clean_uio_map;
-			}
+		/* Try to parse device tree memory for this device */
+		ret = debug_uio_parse_dt_memory(dev_type);
 
-			mem[dev_type][map_type] = memory;
+		for (map_type = 0; map_type < num_maps; map_type++) {
+			if (ret == 0 && dt_mem[dev_type].is_dt_memory) {
+				/* Use device tree memory */
+				size_t map_size = dt_mem[dev_type].rmem->size / num_maps;
+				size_t offset = map_type * map_size;
+
+				/* Cast to char* for proper pointer arithmetic */
+				memory = (void *)((char *)dt_mem[dev_type].base_addr + offset);
+				mem[dev_type][map_type] = memory;
+
+				pr_info("Using DT memory for %s map %d: virt=%px offset=0x%zx size=0x%zx\n",
+					   debug_uio_dev_str[dev_type], map_type,
+					   memory, offset, map_size);
+			} else {
+				/* Fall back to kzalloc */
+				memory = kzalloc(PAGE_SIZE, GFP_KERNEL);
+				if (!memory) {
+					pr_info("Memory allocation failed for dev=%d map=%d\n",
+						   dev_type, map_type);
+					ret = -ENOMEM;
+					goto clean_uio_map;
+				}
+
+				mem[dev_type][map_type] = memory;
+
+				pr_info("Using kzalloc for %s map %d: virt=%px size=0x%lx\n",
+					   debug_uio_dev_str[dev_type], map_type,
+					   memory, PAGE_SIZE);
+			}
 
 			/*
 			 * Initialise the ring buffer that occupies the start
@@ -1285,6 +1510,9 @@ static int __init debug_uio_init(void)
 			 */
 			debug_uio_ring_buffer_init(memory, map_type);
 		}
+
+		/* Reset ret to 0 for next device */
+		ret = 0;
 	}
 
 	/* ------------------------------------------------------------------
@@ -1293,7 +1521,7 @@ static int __init debug_uio_init(void)
 	for (dev_type = 0; dev_type < DEBUG_UIO_DEV_MAX; dev_type++) {
 		info = kzalloc(sizeof(struct uio_info), GFP_KERNEL);
 		if (!info) {
-			DEBUG_WARN("Failed to allocate uio_info for dev=%d\n",
+			pr_info("Failed to allocate uio_info for dev=%d\n",
 				dev_type);
 			ret = -ENOMEM;
 			goto clean_uio_info;
@@ -1311,9 +1539,20 @@ static int __init debug_uio_init(void)
 		num_maps = debug_uio_num_maps_per_device[dev_type];
 
 		for (map_type = 0; map_type < num_maps; map_type++) {
-			info->mem[map_type].addr    =
-				(phys_addr_t)virt_to_phys(mem[dev_type][map_type]);
-			info->mem[map_type].size    = PAGE_SIZE;
+			if (dt_mem[dev_type].is_dt_memory) {
+				/* Use device tree physical address and size */
+				size_t map_size = dt_mem[dev_type].rmem->size / num_maps;
+				size_t offset = map_type * map_size;
+
+				info->mem[map_type].addr = dt_mem[dev_type].rmem->base + offset;
+				info->mem[map_type].size = map_size;
+			} else {
+				/* Use kzalloc'd memory physical address */
+				info->mem[map_type].addr =
+					(phys_addr_t)virt_to_phys(mem[dev_type][map_type]);
+				info->mem[map_type].size = PAGE_SIZE;
+			}
+
 			info->mem[map_type].memtype = UIO_MEM_LOGICAL;
 			info->mem[map_type].name    =
 				debug_uio_map_type_str[dev_type][map_type];
@@ -1330,7 +1569,7 @@ static int __init debug_uio_init(void)
 	}
 
 	/* ------------------------------------------------------------------
-	 * Step 3: Allocate struct device objects.
+	 * Step 3: Allocate and initialize struct device objects.
 	 * ------------------------------------------------------------------ */
 	for (dev_type = 0; dev_type < DEBUG_UIO_DEV_MAX; dev_type++) {
 		dev = kzalloc(sizeof(struct device), GFP_KERNEL);
@@ -1339,6 +1578,8 @@ static int __init debug_uio_init(void)
 			goto clean_uio_dev;
 		}
 
+		/* Initialize device structure before setting properties */
+		device_initialize(dev);
 		dev_set_name(dev, "%s", debug_uio_dev_str[dev_type]);
 		dev->release = debug_uio_dev_release;
 		dev->parent  = NULL;
@@ -1347,16 +1588,21 @@ static int __init debug_uio_init(void)
 	}
 
 	/* ------------------------------------------------------------------
-	 * Step 4: Register struct devices with the driver core.
+	 * Step 4: Add struct devices to the driver core.
+	 *         Use device_add() instead of device_register() since we
+	 *         already called device_initialize() in Step 3.
 	 * ------------------------------------------------------------------ */
 	for (dev_type = 0; dev_type < DEBUG_UIO_DEV_MAX; dev_type++) {
 		dev = dev_global[dev_type];
 
-		ret = device_register(dev);
+		ret = device_add(dev);
 		if (ret) {
-			DEBUG_WARN("device_register failed for dev=%d ret=%d\n",
+			pr_info("device_add failed for dev=%d ret=%d\n",
 				dev_type, ret);
-			debug_uio_dev_unregister(dev_type);
+			/* Unregister previously added devices */
+			while (--dev_type >= 0) {
+				device_del(dev_global[dev_type]);
+			}
 			goto clean_uio_dev;
 		}
 	}
@@ -1374,7 +1620,7 @@ static int __init debug_uio_init(void)
 			goto uio_dev_reg_failed;
 		}
 
-		DEBUG_INFO("Registered UIO device: %s\n",
+		pr_info("Registered UIO device: %s\n",
 			debug_uio_dev_str[dev_type]);
 	}
 
@@ -1385,7 +1631,7 @@ static int __init debug_uio_init(void)
 		for (map_type = 0; map_type < DEBUG_UIO_MAPS_PER_DEV_MAX; map_type++) {
 			BLOCKING_INIT_NOTIFIER_HEAD(
 				&notifier_chains[dev_type][map_type]);
-			DEBUG_INFO("Notifier chain [%d][%d] initialised\n",
+			pr_info("Notifier chain [%d][%d] initialised\n",
 				dev_type, map_type);
 		}
 	}
