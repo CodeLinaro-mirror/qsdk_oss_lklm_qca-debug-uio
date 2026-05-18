@@ -181,10 +181,26 @@ struct debug_uio_data_ring_buffer {
  * debug_uio_info
  *	Wraps the UIO framework's uio_info together with a spinlock that
  *	protects the mem[] array entries from concurrent alloc/free.
+ *
+ *	overwrite_on_full controls the data ring full policy:
+ *	  false (default) – drop the new entry and return -ENOSPC.
+ *	                    This is the original behaviour; all existing
+ *	                    callers that never call debug_uio_set_overwrite_mode()
+ *	                    continue to work without any change.
+ *	  true            – silently discard the oldest entry and write the
+ *	                    new one, so the ring always holds the last
+ *	                    MAX_NUM_DATA_BUFFERS events.
+ *	                    Must be explicitly enabled per-device via
+ *	                    debug_uio_set_overwrite_mode().
+ *
+ *	Because info_global[] is allocated with kzalloc(), overwrite_on_full
+ *	is zero-initialised (false) at module load time, guaranteeing
+ *	backward-compatible drop behaviour unless the caller opts in.
  */
 struct debug_uio_info {
-	struct uio_info *info;	/* UIO framework device descriptor */
-	spinlock_t uio_lock;	/* Protects info->mem[] modifications */
+	struct uio_info *info;		/* UIO framework device descriptor   */
+	spinlock_t uio_lock;		/* Protects info->mem[] modifications */
+	bool overwrite_on_full;		/* Data ring full policy (default: false = drop) */
 };
 
 /* -----------------------------------------------------------------------

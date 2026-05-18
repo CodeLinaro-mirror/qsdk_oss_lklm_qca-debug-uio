@@ -347,6 +347,55 @@ int debug_uio_write_data(const char *dev_name,
 int debug_uio_register_notifier(struct notifier_block *nb,
 			enum debug_uio_dev dev_type, int map_type);
 
+/* -----------------------------------------------------------------------
+ * Data ring overwrite mode API
+ *
+ * By default the data ring uses a drop-on-full policy (backward-compatible
+ * with all existing callers).  Drivers that prefer to always capture the
+ * most recent events can opt in to overwrite mode on a per-device basis
+ * by calling debug_uio_set_overwrite_mode().
+ * ----------------------------------------------------------------------- */
+
+/**
+ * debug_uio_set_overwrite_mode() - Enable or disable overwrite-on-full for
+ *                                  the data ring of a named UIO device.
+ *
+ * Description:
+ *   Controls the behaviour of debug_uio_write_data() when the data ring
+ *   buffer (map 1) is full:
+ *
+ *     @enable = false  (default after module load)
+ *       Preserves the original behaviour: the new entry is dropped and
+ *       debug_uio_write_data() returns -ENOSPC.  All existing callers
+ *       that never invoke this function continue to work unchanged.
+ *       This is the backward-compatible default — no action is required
+ *       from drivers that want the original drop behaviour.
+ *
+ *     @enable = true   (opt-in)
+ *       The oldest entry in the data ring is silently discarded to make
+ *       room for the new one.  The ring always retains the last
+ *       MAX_NUM_DATA_BUFFERS events.  debug_uio_write_data() will never
+ *       return -ENOSPC while overwrite mode is active for this device.
+ *
+ *   The setting is per-device and takes effect immediately.  It can be
+ *   toggled at runtime (e.g. enabled during a debug session and disabled
+ *   afterwards to restore normal back-pressure signalling).
+ *
+ * Input:
+ *   @dev_name – Null-terminated device name string matching one of the
+ *               registered UIO device names ("firmware", "host", "nss").
+ *   @enable   – true  to enable overwrite-on-full (opt-in).
+ *               false to restore the original drop-on-full behaviour.
+ *
+ * Output:
+ *   The overwrite policy for the named device is updated immediately.
+ *
+ * Return:
+ *    0       – Success.
+ *   -ENODEV  – @dev_name is NULL or does not match any registered device.
+ */
+int debug_uio_set_overwrite_mode(const char *dev_name, bool enable);
+
 /**
  * debug_uio_unregister_notifier() - Unregister a previously registered
  *                                   notifier callback.

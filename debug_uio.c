@@ -628,6 +628,15 @@ static bool debug_uio_interrupt_ring_enqueue(
  *   under smp_wmb().  If @data_buf is NULL or @data_size is 0 an empty
  *   (zero-filled) entry is enqueued as a bare notification token.
  *
+ *   When @overwrite is true and the ring is full, the oldest entry is
+ *   silently discarded by advancing the front index before writing the
+ *   new entry.  This keeps the ring at MAX_NUM_DATA_BUFFERS - 1 live
+ *   entries and always preserves the most recent events.
+ *
+ *   When @overwrite is false (the default / backward-compatible path),
+ *   a full ring causes the new entry to be dropped and false is returned,
+ *   identical to the original behaviour.
+ *
  * Input:
  *   @rb        – Pointer to the data ring buffer (start of map 1 page).
  *                Must not be NULL.
@@ -635,19 +644,24 @@ static bool debug_uio_interrupt_ring_enqueue(
  *                @data_size is 0.
  *   @data_size – Number of bytes to copy from @data_buf.  Silently clamped
  *                to MAX_BUFFER_SIZE if larger.
+ *   @overwrite – If true, overwrite the oldest entry when the ring is full
+ *                instead of dropping the new entry.
+ *                If false, preserve the original drop-on-full behaviour.
  *
  * Output:
  *   One debug_uio_data entry is written to rb->buffer[rear] and rb->rear
- *   is advanced to next_rear.
+ *   is advanced to next_rear.  When @overwrite is true and the ring was
+ *   full, rb->front is also advanced to discard the oldest entry.
  *
  * Return:
  *   true  – Entry successfully enqueued.
- *   false – @rb is NULL, or the ring is full (all MAX_NUM_DATA_BUFFERS
- *           slots occupied).
+ *   false – @rb is NULL, or the ring is full and @overwrite is false
+ *           (all MAX_NUM_DATA_BUFFERS slots occupied, entry dropped).
  */
 static bool debug_uio_data_ring_enqueue(
 		struct debug_uio_data_ring_buffer *rb,
-		const void *data_buf, uint32_t data_size)
+		const void *data_buf, uint32_t data_size,
+		bool overwrite)
 {
 	int front, rear, next_rear;
 	struct debug_uio_data entry;
@@ -663,8 +677,26 @@ static bool debug_uio_data_ring_enqueue(
 	next_rear = (rear + 1) % MAX_NUM_DATA_BUFFERS;
 
 	if (next_rear == front) {
-		pr_info("data ring buffer is full\n");
-		return false;
+		if (!overwrite) {
+			/*
+			 * Backward-compatible default: drop the new entry
+			 * and let the caller return -ENOSPC, exactly as the
+			 * original code did.
+			 */
+			pr_info("data ring buffer is full\n");
+			return false;
+		}
+
+		/*
+		 * Overwrite mode (opt-in): discard the oldest entry by
+		 * advancing front, then fall through to write the new entry
+		 * at rear.  The ring always retains the last
+		 * MAX_NUM_DATA_BUFFERS - 1 live entries.
+		 */
+		pr_info("data ring buffer full, overwriting oldest entry\n");
+		smp_wmb();
+		atomic_set(&rb->front, (front + 1) % MAX_NUM_DATA_BUFFERS);
+		smp_wmb();
 	}
 
 	/* Clamp and copy payload. */
@@ -868,7 +900,14 @@ int debug_uio_write_data(const char *dev_name,
 	data_rb = (struct debug_uio_data_ring_buffer *)
 		mem[dev_type][DEBUG_UIO_MAP_TYPE_DATA];
 
-	if (!debug_uio_data_ring_enqueue(data_rb, data, data_size)) {
+	/*
+	 * Pass the per-device overwrite flag.  Callers that have never
+	 * called debug_uio_set_overwrite_mode() get overwrite_on_full==false
+	 * (kzalloc zero-initialises the struct), preserving the original
+	 * drop-on-full / -ENOSPC behaviour.
+	 */
+	if (!debug_uio_data_ring_enqueue(data_rb, data, data_size,
+					 info_global[dev_type].overwrite_on_full)) {
 		pr_info("Data ring enqueue failed for \"%s\"\n", dev_name);
 		return -ENOSPC;
 	}
@@ -912,6 +951,63 @@ EXPORT_SYMBOL(debug_uio_write_data);
  *   Negative  – Error from blocking_notifier_chain_register() (e.g.
  *               -EEXIST if @nb is already on this chain).
  */
+/**
+ * debug_uio_set_overwrite_mode() - Enable or disable overwrite-on-full for
+ *                                  the data ring of a named UIO device.
+ *
+ * Description:
+ *   Controls the behaviour of debug_uio_write_data() when the data ring
+ *   buffer (map 1) is full:
+ *
+ *     @enable = false  (default after module load)
+ *       Preserves the original behaviour: the new entry is dropped and
+ *       debug_uio_write_data() returns -ENOSPC.  All existing callers
+ *       that never invoke this function continue to work unchanged.
+ *
+ *     @enable = true   (opt-in)
+ *       The oldest entry in the data ring is silently discarded to make
+ *       room for the new one.  The ring always retains the last
+ *       MAX_NUM_DATA_BUFFERS events.  debug_uio_write_data() never
+ *       returns -ENOSPC while overwrite mode is active.
+ *
+ *   The flag is stored in info_global[dev_type].overwrite_on_full and
+ *   is read lock-free in the enqueue hot path.  Because it is a single
+ *   bool written by one thread and read by another, READ_ONCE / plain
+ *   assignment is sufficient on all supported architectures.
+ *
+ *   Backward compatibility guarantee:
+ *     info_global[] is allocated with kzalloc(), so overwrite_on_full is
+ *     zero-initialised (false) at module load time.  Drivers that do not
+ *     call this function automatically get the original drop behaviour.
+ *
+ * Input:
+ *   @dev_name – Null-terminated device name string matching one of the
+ *               registered UIO device names ("firmware", "host", "nss").
+ *   @enable   – true  to enable overwrite-on-full (opt-in).
+ *               false to restore the original drop-on-full behaviour.
+ *
+ * Output:
+ *   info_global[dev_type].overwrite_on_full is set to @enable.
+ *
+ * Return:
+ *    0       – Success.
+ *   -ENODEV  – @dev_name is NULL or not recognised.
+ */
+int debug_uio_set_overwrite_mode(const char *dev_name, bool enable)
+{
+	int dev_type;
+
+	dev_type = debug_uio_find_dev_by_name(dev_name);
+	if (dev_type < 0)
+		return dev_type;
+
+	info_global[dev_type].overwrite_on_full = enable;
+	pr_info("Data ring overwrite mode %s for \"%s\"\n",
+		enable ? "enabled" : "disabled", dev_name);
+	return 0;
+}
+EXPORT_SYMBOL(debug_uio_set_overwrite_mode);
+
 int debug_uio_register_notifier(struct notifier_block *nb,
 				enum debug_uio_dev dev_type, int map_type)
 {
