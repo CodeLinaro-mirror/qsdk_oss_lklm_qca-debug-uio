@@ -145,6 +145,22 @@ struct debug_uio_data {
 	} payload;
 };
 
+#define DEBUG_UIO_APP_NAME_MAX 32
+
+/*
+ * debug_uio_app_status_data
+ *	Payload for IOCTL_APP_STATUS.  Sent by a userspace app to announce
+ *	that it is up or down.  Unlike debug_uio_intr_data, this is not tied
+ *	to any UIO device/map — app_name lets subsystem drivers filter for
+ *	the specific app(s) they depend on.
+ */
+struct debug_uio_app_status_data {
+	char    app_name[DEBUG_UIO_APP_NAME_MAX];
+	uint8_t is_up;			/* 1 = up, 0 = down */
+};
+
+#define IOCTL_APP_STATUS	_IOW('u', 2, struct debug_uio_app_status_data)
+
 /*
  * debug_uio_interrupt_ring_buffer
  *	Lock-free single-producer / single-consumer ring buffer stored at

@@ -94,6 +94,15 @@ static struct blocking_notifier_head
 	notifier_chains[DEBUG_UIO_DEV_MAX][DEBUG_UIO_MAPS_PER_DEV_MAX];
 
 /*
+ * app_status_notifier_chain – single global chain (not indexed by
+ * device/map) for the userspace-app-is-up/down signal sent via
+ * IOCTL_APP_STATUS.  Subsystem drivers register on this chain instead of
+ * notifier_chains[][] because the event isn't tied to a specific UIO
+ * device or map.
+ */
+static struct blocking_notifier_head app_status_notifier_chain;
+
+/*
  * dt_mem[] – device tree memory tracking for each UIO device.
  * Stores device tree node, reserved memory info, and virtual base address
  * for devices that use device tree memory allocation.
@@ -1051,6 +1060,75 @@ int debug_uio_unregister_notifier(struct notifier_block *nb,
 }
 EXPORT_SYMBOL(debug_uio_unregister_notifier);
 
+/**
+ * debug_uio_register_app_status_notifier() - Register a callback to receive
+ *                                            userspace-app up/down events.
+ *
+ * Description:
+ *   Registers @nb with the global app-status notifier chain.  Whenever a
+ *   userspace app calls ioctl(IOCTL_APP_STATUS) on
+ *   /dev/debug_uio_char_dev, every callback on this chain is invoked with
+ *   @action set to the app's is_up flag (1 or 0) and @data pointing to a
+ *   NUL-terminated app name string.  Unlike debug_uio_register_notifier(),
+ *   this chain is not scoped to a UIO device or map — drivers filter by
+ *   app name themselves inside their callback.
+ *
+ *   Per the current design there is no status replay: a driver that
+ *   registers after an app has already signalled "up" will not see that
+ *   past event, only future ones, matching how debug_uio_notify() and
+ *   debug_uio_register_notifier() already behave.
+ *
+ * Input:
+ *   @nb – Caller's notifier_block with .notifier_call set to the callback
+ *         function:
+ *         int cb(struct notifier_block *nb, unsigned long action, void *data)
+ *         where @action is is_up (0/1) and @data is a const char * app
+ *         name valid only for the duration of the callback — copy it if
+ *         it needs to be kept.
+ *
+ * Output:
+ *   @nb inserted into app_status_notifier_chain.
+ *
+ * Return:
+ *    0        – Success.
+ *   Negative  – Error from blocking_notifier_chain_register() (e.g.
+ *               -EEXIST if @nb is already on this chain).
+ */
+int debug_uio_register_app_status_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&app_status_notifier_chain, nb);
+}
+EXPORT_SYMBOL(debug_uio_register_app_status_notifier);
+
+/**
+ * debug_uio_unregister_app_status_notifier() - Unregister a previously
+ *                                              registered app-status
+ *                                              callback.
+ *
+ * Description:
+ *   Removes @nb from the global app-status notifier chain.  Must be
+ *   called before @nb is freed (e.g. in the driver's remove() or exit())
+ *   to prevent a use-after-free when the next IOCTL_APP_STATUS event
+ *   fires.
+ *
+ * Input:
+ *   @nb – Same notifier_block pointer passed to
+ *         debug_uio_register_app_status_notifier().
+ *
+ * Output:
+ *   @nb removed from app_status_notifier_chain.
+ *
+ * Return:
+ *    0        – Success.
+ *   Negative  – Error from blocking_notifier_chain_unregister() (e.g.
+ *               -ENOENT if @nb was not found on the chain).
+ */
+int debug_uio_unregister_app_status_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&app_status_notifier_chain, nb);
+}
+EXPORT_SYMBOL(debug_uio_unregister_app_status_notifier);
+
 /* -----------------------------------------------------------------------
  * Character device – ioctl interface
  *
@@ -1065,35 +1143,51 @@ EXPORT_SYMBOL(debug_uio_unregister_notifier);
  *                     /dev/debug_uio_char_dev.
  *
  * Description:
- *   Handles the IOCTL_SEND_INTERRUPT command, which allows userspace to
- *   inject an interrupt event into the kernel.  The function copies a
- *   debug_uio_intr_data struct from userspace, validates the uioId and
- *   mapId fields, and fires the blocking notifier chain for the
- *   corresponding (device, map) pair.  All registered kernel-driver
- *   callbacks on that chain are invoked synchronously with the 4-byte
- *   raw payload as the data argument.
+ *   Handles two commands:
+ *
+ *   IOCTL_SEND_INTERRUPT allows userspace to inject an interrupt event
+ *   into the kernel.  The function copies a debug_uio_intr_data struct
+ *   from userspace, validates the uioId and mapId fields, and fires the
+ *   blocking notifier chain for the corresponding (device, map) pair.
+ *   All registered kernel-driver callbacks on that chain are invoked
+ *   synchronously with the 4-byte raw payload as the data argument.
+ *
+ *   IOCTL_APP_STATUS allows a userspace app to announce that it is up or
+ *   down.  The function copies a debug_uio_app_status_data struct from
+ *   userspace and fires the global app_status_notifier_chain — not scoped
+ *   to any device/map — with the is_up flag as the notifier action and
+ *   the NUL-terminated app name as the data argument.
  *
  * Input:
  *   @file – File descriptor of the open /dev/debug_uio_char_dev node.
- *   @cmd  – Ioctl command code.  Only IOCTL_SEND_INTERRUPT is handled;
- *           all other values return -ENOTTY.
+ *   @cmd  – Ioctl command code.  IOCTL_SEND_INTERRUPT and IOCTL_APP_STATUS
+ *           are handled; all other values return -ENOTTY.
  *   @arg  – For IOCTL_SEND_INTERRUPT: userspace pointer to a
  *           struct debug_uio_intr_data containing:
  *             .uioId   – Target device index (0–2).
  *             .mapId   – Target map index (0–1).
  *             .payload – 4-byte raw interrupt payload passed to callbacks.
+ *           For IOCTL_APP_STATUS: userspace pointer to a
+ *           struct debug_uio_app_status_data containing:
+ *             .app_name – Name of the announcing app (need not be
+ *                         NUL-terminated by the caller; the kernel forces
+ *                         NUL-termination before use).
+ *             .is_up    – 1 if the app is up, 0 if it is going down.
  *
  * Output:
- *   All notifier callbacks registered on
+ *   For IOCTL_SEND_INTERRUPT: all notifier callbacks registered on
  *   notifier_chains[data.uioId][data.mapId] are invoked with
  *   data.payload.raw as the data argument.
+ *   For IOCTL_APP_STATUS: all notifier callbacks registered on
+ *   app_status_notifier_chain are invoked with status.app_name as the
+ *   data argument and status.is_up as the action.
  *
  * Return:
  *    0       – Success; notifier chain fired.
  *   -EFAULT  – copy_from_user() failed (bad userspace pointer).
  *   -EINVAL  – data.uioId is out of range (>= DEBUG_UIO_DEV_MAX).
  *   -ENOTTY  – data.mapId refers to an unallocated map, or @cmd is
- *              not IOCTL_SEND_INTERRUPT.
+ *              not a recognised command.
  */
 static long debug_uio_ioctl(struct file *file, unsigned int cmd,
 			unsigned long arg)
@@ -1128,6 +1222,25 @@ static long debug_uio_ioctl(struct file *file, unsigned int cmd,
 			&notifier_chains[data.uioId][data.mapId],
 			0, (void *)(uintptr_t)data.payload.raw);
 		break;
+
+	case IOCTL_APP_STATUS: {
+		struct debug_uio_app_status_data status;
+
+		if (copy_from_user(&status, (void __user *)arg, sizeof(status))) {
+			pr_info("copy_from_user failed for IOCTL_APP_STATUS.\n");
+			return -EFAULT;
+		}
+
+		/* Defensive: userspace input may not be NUL-terminated. */
+		status.app_name[DEBUG_UIO_APP_NAME_MAX - 1] = '\0';
+
+		pr_info("IOCTL_APP_STATUS: app=\"%s\" is_up=%u\n",
+			status.app_name, status.is_up);
+
+		blocking_notifier_call_chain(&app_status_notifier_chain,
+					      status.is_up, status.app_name);
+		break;
+	}
 
 	default:
 		pr_info("Unknown ioctl command 0x%x\n", cmd);
@@ -1731,6 +1844,9 @@ static int __init debug_uio_init(void)
 				dev_type, map_type);
 		}
 	}
+
+	BLOCKING_INIT_NOTIFIER_HEAD(&app_status_notifier_chain);
+	pr_info("App status notifier chain initialised\n");
 
 	/* ------------------------------------------------------------------
 	 * Step 7: Register the char device for the ioctl interface.

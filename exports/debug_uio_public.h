@@ -430,4 +430,82 @@ int debug_uio_set_overwrite_mode(const char *dev_name, bool enable);
 int debug_uio_unregister_notifier(struct notifier_block *nb,
 			enum debug_uio_dev dev_type, int map_type);
 
+/* -----------------------------------------------------------------------
+ * App status notifier registration APIs
+ *
+ * These APIs let kernel drivers learn when a userspace app announces that
+ * it is up or down via ioctl(IOCTL_APP_STATUS) on
+ * /dev/debug_uio_char_dev.  Unlike debug_uio_register_notifier(), this
+ * chain is global — it is not scoped to a UIO device or map, since the
+ * event itself (an app's liveness) isn't tied to either.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * debug_uio_register_app_status_notifier() - Register a callback to
+ *                                            receive userspace-app
+ *                                            up/down events.
+ *
+ * Description:
+ *   Registers @nb with the global app-status notifier chain.  When a
+ *   userspace app calls ioctl(IOCTL_APP_STATUS), every callback on this
+ *   chain is invoked with the app's is_up flag (1 or 0) as the notifier
+ *   action and a pointer to the app's NUL-terminated name as the data
+ *   argument.  A driver typically calls this during its probe() or
+ *   init() function and inspects the app name itself to decide whether
+ *   the event is relevant to it.
+ *
+ *   There is no status replay: a driver that registers after an app has
+ *   already signalled "up" will not see that past event, only future
+ *   ones — the same behaviour as debug_uio_register_notifier().
+ *
+ * Input:
+ *   @nb – Pointer to the caller's notifier_block.  The .notifier_call
+ *         field must point to the callback function with signature:
+ *         int callback(struct notifier_block *nb,
+ *                      unsigned long action, void *data)
+ *         where @action is the is_up flag (0/1) and @data is a
+ *         const char * pointing to the NUL-terminated app name.  The
+ *         pointer is only valid for the duration of the callback — copy
+ *         the name if it needs to be kept.
+ *
+ * Output:
+ *   @nb is inserted into the global app-status notifier chain.
+ *
+ * Return:
+ *    0          – Success; @nb is now registered.
+ *   Negative    – Error code from blocking_notifier_chain_register()
+ *                 (e.g. -EEXIST if @nb is already registered on this
+ *                 chain).
+ */
+int debug_uio_register_app_status_notifier(struct notifier_block *nb);
+
+/**
+ * debug_uio_unregister_app_status_notifier() - Unregister a previously
+ *                                              registered app-status
+ *                                              callback.
+ *
+ * Description:
+ *   Removes @nb from the global app-status notifier chain.  After this
+ *   call the callback will no longer be invoked when a userspace app
+ *   sends an IOCTL_APP_STATUS event.
+ *
+ *   A driver typically calls this during its remove() or exit() function
+ *   to clean up its subscription before the notifier_block is freed.
+ *   Failing to unregister before freeing @nb will cause a use-after-free
+ *   when the next IOCTL_APP_STATUS event fires.
+ *
+ * Input:
+ *   @nb – Pointer to the same notifier_block that was passed to
+ *         debug_uio_register_app_status_notifier().
+ *
+ * Output:
+ *   @nb is removed from the global app-status notifier chain.
+ *
+ * Return:
+ *    0          – Success; @nb has been removed.
+ *   Negative    – Error code from blocking_notifier_chain_unregister()
+ *                 (e.g. -ENOENT if @nb was not found on the chain).
+ */
+int debug_uio_unregister_app_status_notifier(struct notifier_block *nb);
+
 #endif /* __DEBUG_UIO_PUBLIC_H_ */
